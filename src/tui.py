@@ -29,6 +29,7 @@ from .systemd import (
 )
 from .hosts import get_hosts_status, update_hosts, remove_hosts
 from .tester import run_target_tests, parse_targets
+from .sync import sync_flowseal
 
 
 # ANSI Colors
@@ -295,7 +296,7 @@ def interactive_menu():
         print("     9. Run Target Tests (YouTube, Discord, etc.)")
         print("     10. Auto-Benchmark All Strategies (Find best)")
         print("     11. Update /etc/hosts (Discord Voice & Telegram)")
-        print("     12. Update IPSet & Hostlists from GitHub")
+        print("     12. Sync with Flowseal (Auto-update strategies & lists)")
         print("     13. Run Diagnostics")
         print()
         print("  ----------------------------------------------------------")
@@ -363,12 +364,26 @@ def interactive_menu():
             menu_update_hosts()
         elif choice == "12":
             clear_screen()
-            print(f"\n{CLR_BOLD}Updating IPSet and domain lists from Flowseal repository...{CLR_RESET}\n")
+            print(f"\n{CLR_BOLD}Syncing strategies, payloads, and lists with Flowseal GitHub...{CLR_RESET}\n")
             try:
-                update_upstream_lists()
-                print(f"{CLR_GREEN}Lists successfully updated!{CLR_RESET}")
+                res = sync_flowseal()
+                print(f"{CLR_GREEN}=== Sync Summary ==={CLR_RESET}")
+                if res["strategies_new"]:
+                    print(f"  {CLR_GREEN}[+] New strategies ({len(res['strategies_new'])}): {', '.join(res['strategies_new'])}{CLR_RESET}")
+                if res["strategies_updated"]:
+                    print(f"  {CLR_YELLOW}[*] Updated strategies ({len(res['strategies_updated'])}): {', '.join(res['strategies_updated'])}{CLR_RESET}")
+                if res["bins_downloaded"]:
+                    print(f"  {CLR_CYAN}[+] New payloads ({len(res['bins_downloaded'])}): {', '.join(res['bins_downloaded'])}{CLR_RESET}")
+                if res["lists_updated"]:
+                    print(f"  {CLR_CYAN}[*] Updated lists ({len(res['lists_updated'])}): {', '.join(res['lists_updated'])}{CLR_RESET}")
+                print(f"  Total unchanged strategies: {res['strategies_unchanged']}")
+                if res["errors"]:
+                    print(f"  {CLR_RED}Warnings/Errors:{CLR_RESET}")
+                    for err in res["errors"]:
+                        print(f"    - {err}")
+                print(f"\n{CLR_GREEN}Sync complete!{CLR_RESET}")
             except Exception as e:
-                print(f"{CLR_RED}Update failed: {e}{CLR_RESET}")
+                print(f"{CLR_RED}Sync failed: {e}{CLR_RESET}")
             print("\nPress Enter to continue...")
             input()
         elif choice == "13":

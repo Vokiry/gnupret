@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verify Python code compilation
+        run: |
+          python3 -m compileall src/
+
+      - name: Download nfqws binary if needed
+        run: |
+          chmod +x bin/nfqws || true
+          bin/nfqws --version
+
+      - name: Verify all strategies with nfqws dry-run
+        run: |
+          python3 -c "
+          import subprocess, sys
+          from src.strategy import list_strategies
+
+          strats = list_strategies()
+          assert len(strats) > 0, 'No strategies found!'
+          failures = 0
+          for s in strats.values():
+              args = ['bin/nfqws', '--dry-run'] + s.build_nfqws_args(qnum=200)
+              res = subprocess.run(args, capture_output=True, text=True)
+              if res.returncode != 0:
+                  print(f'FAIL {s.name}: {res.stderr.strip() or res.stdout.strip()}')
+                  failures += 1
+              else:
+                  print(f'OK: {s.name} ({s.filename})')
+          if failures > 0:
+              sys.exit(1)
+          print(f'All {len(strats)} strategies verified successfully!')
+          "
+
+      - name: Test CLI commands
+        run: |
+          ./gnupret list
+          ./gnupret status

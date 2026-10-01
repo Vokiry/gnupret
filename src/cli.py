@@ -26,6 +26,7 @@ from .systemd import (
 from .hosts import update_hosts, remove_hosts, get_hosts_status
 from .tester import run_target_tests
 from .tui import interactive_menu
+from .sync import sync_flowseal, import_bat_file
 
 
 def check_root():
@@ -204,6 +205,40 @@ def cmd_firewall_cleanup(args):
     fw.teardown()
 
 
+def cmd_sync(args):
+    print("Syncing strategies, payloads, and lists with Flowseal repository...")
+    try:
+        res = sync_flowseal()
+        print("\n=== Sync Summary ===")
+        if res["strategies_new"]:
+            print(f"  [+] New strategies added ({len(res['strategies_new'])}): {', '.join(res['strategies_new'])}")
+        if res["strategies_updated"]:
+            print(f"  [*] Strategies updated ({len(res['strategies_updated'])}): {', '.join(res['strategies_updated'])}")
+        if res["bins_downloaded"]:
+            print(f"  [+] Fake payloads downloaded ({len(res['bins_downloaded'])}): {', '.join(res['bins_downloaded'])}")
+        if res["lists_updated"]:
+            print(f"  [*] Lists updated ({len(res['lists_updated'])}): {', '.join(res['lists_updated'])}")
+        print(f"  Total unchanged: {res['strategies_unchanged']} strategies")
+        if res["errors"]:
+            print(f"  Warnings/Errors ({len(res['errors'])}):")
+            for err in res["errors"]:
+                print(f"    - {err}")
+        print("\nSync completed successfully!")
+    except Exception as e:
+        print(f"Sync failed: {e}")
+        sys.exit(1)
+
+
+def cmd_import(args):
+    print(f"Importing strategy from: {args.source}...")
+    ok, msg, strat_id = import_bat_file(args.source)
+    if ok:
+        print(f"[OK] {msg}")
+    else:
+        print(f"[FAIL] {msg}")
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="gnupret",
@@ -261,6 +296,15 @@ def main():
     p_hosts = subparsers.add_parser("hosts", help="Manage /etc/hosts updates")
     p_hosts.add_argument("action", choices=["update", "remove"])
     p_hosts.set_defaults(func=cmd_hosts)
+
+    # sync
+    p_sync = subparsers.add_parser("sync", help="Sync all strategies, fake payloads and lists from Flowseal GitHub")
+    p_sync.set_defaults(func=cmd_sync)
+
+    # import
+    p_import = subparsers.add_parser("import", help="Import a custom .bat strategy file or URL into gnupret")
+    p_import.add_argument("source", help="File path or URL to .bat file")
+    p_import.set_defaults(func=cmd_import)
 
     # daemon / internal
     p_daemon = subparsers.add_parser("daemon", help=argparse.SUPPRESS)

@@ -4,7 +4,7 @@ from pathlib import Path
 from .config import BASE_DIR
 
 HOSTS_PATH = Path("/etc/hosts")
-LOCAL_HOSTS_FILE = BASE_DIR / ".service" / "hosts"
+LOCAL_HOSTS_FILE = BASE_DIR / "lists" / "hosts"
 REMOTE_HOSTS_URL = "https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/refs/heads/main/.service/hosts"
 
 MARKER_BEGIN = "# --- GNUPRET DISCORD/TELEGRAM HOSTS BEGIN ---"
