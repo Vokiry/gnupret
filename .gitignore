@@ -4,5 +4,10 @@
 /lists/list-general-user.txt
 /lists/list-exclude-user.txt
 
+# Python & config
+__pycache__/
+*.pyc
+config.json
+
 .vscode/
 /build/
