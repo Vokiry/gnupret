@@ -88,7 +88,7 @@ def menu_select_strategy(cfg: dict) -> Strategy:
     try:
         choice = input("  Select strategy number: ").strip()
         if choice in ("0", ""):
-            return get_strategy(cfg.get("strategy", "general.bat")) or strat_list[0]
+            return get_strategy(cfg.get("strategy", "general.conf")) or strat_list[0]
         c_int = int(choice)
         if 1 <= c_int <= len(strat_list):
             selected = strat_list[c_int - 1]
@@ -99,7 +99,7 @@ def menu_select_strategy(cfg: dict) -> Strategy:
             return selected
     except Exception:
         pass
-    return get_strategy(cfg.get("strategy", "general.bat")) or strat_list[0]
+    return get_strategy(cfg.get("strategy", "general.conf")) or strat_list[0]
 
 
 def menu_toggle_game_filter(cfg: dict):
@@ -262,7 +262,7 @@ def interactive_menu():
 
     while True:
         cfg = load_config()
-        strat = get_strategy(cfg.get("strategy", "general.bat")) or list_strategies().get("general")
+        strat = get_strategy(cfg.get("strategy", "general.conf")) or list_strategies().get("general")
         clear_screen()
         print_banner(cfg, strat)
 

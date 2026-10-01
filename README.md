@@ -49,7 +49,7 @@ sudo ./gnupret
 ```text
 ============================================================
              GNUPRET SERVICE MANAGER (Linux)
-   Strategy:    ALT2 (general (ALT2).bat)
+   Strategy:    ALT2 (alt2.conf)
    Process:     RUNNING (PID: 1234)
    Systemd:     Active & Enabled
    Game Filter: DISABLED [TCP/UDP 1024-65535]
@@ -170,7 +170,7 @@ gnupret/
 │   └── cli.py              # CLI диспетчер команд
 ├── bin/                    # Бинарник nfqws и фейковые пакеты (.bin)
 ├── lists/                  # Списки хостов и IP (YouTube, Google, Discord)
-├── strategies/             # Стратегии (.bat / .conf)
+├── strategies/             # Нативные конфигурации стратегий (.conf)
 └── utils/
     └── targets.txt         # Целевые адреса для проверки доступности
 ```

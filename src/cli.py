@@ -61,7 +61,7 @@ def cmd_select(args):
 def cmd_run(args):
     check_root()
     cfg = load_config()
-    strat_query = args.strategy or cfg.get("strategy", "general.bat")
+    strat_query = args.strategy or cfg.get("strategy", "general.conf")
     strat = get_strategy(strat_query)
     if not strat:
         print(f"Error: Strategy '{strat_query}' not found.")
@@ -73,7 +73,7 @@ def cmd_run(args):
 def cmd_start(args):
     check_root()
     cfg = load_config()
-    strat_query = args.strategy or cfg.get("strategy", "general.bat")
+    strat_query = args.strategy or cfg.get("strategy", "general.conf")
     strat = get_strategy(strat_query)
     if not strat:
         print(f"Error: Strategy '{strat_query}' not found.")
@@ -189,7 +189,7 @@ def cmd_daemon(args):
     """Entry point for systemd service ExecStart."""
     check_root()
     cfg = load_config()
-    strat = get_strategy(cfg.get("strategy", "general.bat"))
+    strat = get_strategy(cfg.get("strategy", "general.conf"))
     if not strat:
         print("Strategy not found, cannot run daemon.")
         sys.exit(1)

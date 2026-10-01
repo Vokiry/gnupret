@@ -12,7 +12,7 @@ CONFIG_FILE = BASE_DIR / "config.json"
 PID_FILE = Path("/tmp/gnupret.pid")
 
 DEFAULT_CONFIG = {
-    "strategy": "general.bat",
+    "strategy": "general.conf",
     "game_filter_mode": "disabled", # "disabled", "all", "tcp", "udp"
     "game_filter_tcp": "1024-65535",
     "game_filter_udp": "1024-65535",

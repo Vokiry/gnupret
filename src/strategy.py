@@ -32,10 +32,10 @@ class Strategy:
         use_tcp = game_filter_mode in ("all", "tcp")
         use_udp = game_filter_mode in ("all", "udp")
 
-        tcp_val = tcp_val.replace("%GameFilterTCP%", tcp_range if use_tcp else "")
-        tcp_val = tcp_val.replace("%GameFilter%", tcp_range if use_tcp else "")
-        udp_val = udp_val.replace("%GameFilterUDP%", udp_range if use_udp else "")
-        udp_val = udp_val.replace("%GameFilter%", udp_range if use_udp else "")
+        for key in ("%GameFilterTCP%", "{GAME_FILTER_TCP}", "%GameFilter%"):
+            tcp_val = tcp_val.replace(key, tcp_range if use_tcp else "")
+        for key in ("%GameFilterUDP%", "{GAME_FILTER_UDP}", "%GameFilter%"):
+            udp_val = udp_val.replace(key, udp_range if use_udp else "")
 
         # Clean up empty commas
         tcp_ports = [p.strip() for p in re.split(r",+", tcp_val) if p.strip() and p.strip() != "12"]
@@ -58,13 +58,17 @@ class Strategy:
         use_udp = game_filter_mode in ("all", "udp")
 
         content = self.raw_args
+        # Replace paths
+        content = content.replace("{BIN}", str(BIN_DIR))
+        content = content.replace("{LISTS}", str(LISTS_DIR))
         content = content.replace("%BIN%", str(BIN_DIR) + "/")
         content = content.replace("%LISTS%", str(LISTS_DIR) + "/")
 
         # Replace GameFilter variables
-        content = content.replace("%GameFilterTCP%", tcp_range if use_tcp else "12")
-        content = content.replace("%GameFilterUDP%", udp_range if use_udp else "12")
-        content = content.replace("%GameFilter%", (tcp_range if use_tcp else "12"))
+        for key in ("%GameFilterTCP%", "{GAME_FILTER_TCP}", "%GameFilter%"):
+            content = content.replace(key, tcp_range if use_tcp else "12")
+        for key in ("%GameFilterUDP%", "{GAME_FILTER_UDP}"):
+            content = content.replace(key, udp_range if use_udp else "12")
 
         # Fix batch escaped exclamation marks for nfqws
         content = content.replace("^!", "!")
@@ -78,82 +82,66 @@ class Strategy:
 
 
 def _natural_sort_key(file_path: Path):
-    name = file_path.name.lower()
-    if name == "general.bat":
+    stem = file_path.stem.lower()
+    if stem in ("general", "default"):
         return (0, 0, "")
-    if " (alt).bat" in name:
+    if stem == "alt":
         return (1, 1, "")
-    m = re.search(r"\(alt(\d+)\)\.bat", name)
+    m = re.match(r"^alt(\d+)$", stem)
     if m:
         return (1, int(m.group(1)), "")
-    return (2, 0, name)
+    return (2, 0, stem)
 
 
-def parse_bat_file(file_path: Path) -> Optional[Strategy]:
-    """Parse a Flowseal .bat strategy file."""
+def parse_conf_file(file_path: Path) -> Optional[Strategy]:
+    """Parse a native gnupret .conf strategy file."""
     if not file_path.exists():
         return None
 
     try:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
+        content = file_path.read_text(encoding="utf-8")
     except Exception:
         return None
 
-    # Merge multiline commands separated by ^
-    content = re.sub(r"\^\s*[\r\n]+", " ", content)
+    name = file_path.stem.upper()
+    raw_tcp = "80,443,2053,2083,2087,2096,8443,{GAME_FILTER_TCP}"
+    raw_udp = "443,19294-19344,50000-50100,{GAME_FILTER_UDP}"
+    arg_lines = []
 
-    # Locate the winws execution line
-    winws_match = re.search(r'winws(?:\.exe)?[\"\'\s]+(.*?)(?:\r?\n|$)', content, re.IGNORECASE)
-    if not winws_match:
-        return None
-
-    raw_args = winws_match.group(1).strip()
-
-    # Extract --wf-tcp and --wf-udp
-    tcp_match = re.search(r"--wf-tcp=([^\s]+)", raw_args)
-    udp_match = re.search(r"--wf-udp=([^\s]+)", raw_args)
-
-    raw_tcp = tcp_match.group(1) if tcp_match else "80,443,2053,2083,2087,2096,8443"
-    raw_udp = udp_match.group(1) if udp_match else "443,19294-19344,50000-50100"
-
-    # Remove wf-tcp and wf-udp from args
-    cleaned_args = re.sub(r"--wf-(?:tcp|udp)=[^\s]+", "", raw_args).strip()
-
-    filename = file_path.name
-    # Generate friendly name and ID
-    if filename.lower() == "general.bat":
-        strategy_id = "general"
-        name = "Default (general)"
-    else:
-        # e.g. "general (ALT2).bat" -> "ALT2"
-        match = re.search(r"general\s*\((.*?)\)\.bat", filename, re.IGNORECASE)
-        if match:
-            clean_name = match.group(1).strip()
-            name = clean_name
-            strategy_id = clean_name.lower().replace(" ", "_")
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("NAME="):
+            name = line.split("=", 1)[1].strip()
+        elif line.startswith("TCP_PORTS="):
+            raw_tcp = line.split("=", 1)[1].strip()
+        elif line.startswith("UDP_PORTS="):
+            raw_udp = line.split("=", 1)[1].strip()
         else:
-            name = file_path.stem
-            strategy_id = file_path.stem.lower().replace(" ", "_")
+            arg_lines.append(line)
+
+    raw_args = " ".join(arg_lines)
+    strategy_id = file_path.stem.lower()
 
     return Strategy(
         strategy_id=strategy_id,
         name=name,
-        filename=filename,
+        filename=file_path.name,
         raw_tcp=raw_tcp,
         raw_udp=raw_udp,
-        raw_args=cleaned_args
+        raw_args=raw_args
     )
 
 
 def list_strategies(base_dir: Path = BASE_DIR) -> Dict[str, Strategy]:
-    """Find and parse all available strategies."""
+    """Find and parse all available strategies in strategies/ directory."""
     strategies: Dict[str, Strategy] = {}
-    search_dir = STRATEGIES_DIR if STRATEGIES_DIR.exists() and any(STRATEGIES_DIR.glob("*.bat")) else base_dir
-    bat_files = sorted(search_dir.glob("general*.bat"), key=_natural_sort_key)
+    search_dir = STRATEGIES_DIR if STRATEGIES_DIR.exists() else base_dir
 
-    for p in bat_files:
-        strat = parse_bat_file(p)
+    conf_files = sorted(search_dir.glob("*.conf"), key=_natural_sort_key)
+    for p in conf_files:
+        strat = parse_conf_file(p)
         if strat:
             strategies[strat.id] = strat
 
@@ -168,6 +156,11 @@ def get_strategy(strategy_query: str, base_dir: Path = BASE_DIR) -> Optional[Str
     # Exact ID match
     if query_lower in strats:
         return strats[query_lower]
+
+    # Without extension match
+    stem = Path(query_lower).stem
+    if stem in strats:
+        return strats[stem]
 
     # Filename match
     for s in strats.values():
