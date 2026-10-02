@@ -75,9 +75,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory={BASE_DIR}
-ExecStart={python_bin} {gnupret_bin} daemon
-ExecStopPost={python_bin} {gnupret_bin} firewall-cleanup
+WorkingDirectory="{BASE_DIR}"
+ExecStart="{python_bin}" "{gnupret_bin}" daemon
+ExecStopPost="{python_bin}" "{gnupret_bin}" firewall-cleanup
 Restart=always
 RestartSec=3
 KillMode=mixed

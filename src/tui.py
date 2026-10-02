@@ -1,36 +1,35 @@
 import os
 import sys
 import time
-import shutil
-import urllib.request
-from typing import Dict, List
+from typing import Dict
 
 from .config import (
-    BASE_DIR,
-    LISTS_DIR,
     load_config,
     save_config,
     get_ipset_status,
     set_ipset_mode,
     detect_default_interface,
-    update_upstream_lists
 )
 from .strategy import Strategy, list_strategies, get_strategy
 from .firewall import FirewallManager
-from .runner import Runner, get_running_status, check_conflicts, get_nfqws_path
+from .runner import (
+    Runner,
+    get_running_status,
+    check_conflicts,
+    get_nfqws_path,
+    is_systemd_service_active,
+)
 from .systemd import (
-    is_systemd_available,
     get_service_status,
     install_service,
     remove_service,
     start_service,
-    stop_service,
-    restart_service
+    restart_service,
+    enable_service,
 )
-from .hosts import get_hosts_status, update_hosts, remove_hosts
-from .tester import run_target_tests, parse_targets
+from .hosts import get_hosts_status, update_hosts
+from .tester import run_target_tests, benchmark_all_strategies
 from .sync import sync_flowseal
-
 
 # ANSI Colors
 CLR_RESET = "\033[0m"
@@ -50,7 +49,12 @@ def print_banner(cfg: dict, active_strategy: Strategy):
     is_running, pid, _ = get_running_status()
     srv_status = get_service_status()
 
-    status_str = f"{CLR_GREEN}RUNNING (PID: {pid}){CLR_RESET}" if is_running else f"{CLR_RED}STOPPED{CLR_RESET}"
+    if srv_status.get("active"):
+        status_str = f"{CLR_GREEN}RUNNING (systemd, PID: {pid}){CLR_RESET}"
+    elif is_running:
+        status_str = f"{CLR_GREEN}RUNNING (daemon, PID: {pid}){CLR_RESET}"
+    else:
+        status_str = f"{CLR_RED}STOPPED{CLR_RESET}"
 
     if srv_status.get("installed"):
         if srv_status.get("active"):
@@ -62,7 +66,7 @@ def print_banner(cfg: dict, active_strategy: Strategy):
 
     game_mode = cfg.get("game_filter_mode", "disabled")
     ipset_mode = get_ipset_status()
-    iface = cfg.get("interface", "auto")
+    iface = cfg.get("interface", "any")
 
     print(f"{CLR_CYAN}{CLR_BOLD}============================================================{CLR_RESET}")
     print(f"             {CLR_BOLD}GNUPRET SERVICE MANAGER (Linux){CLR_RESET}")
@@ -96,6 +100,8 @@ def menu_select_strategy(cfg: dict) -> Strategy:
             cfg["strategy"] = selected.filename
             save_config(cfg)
             print(f"\n{CLR_GREEN}Switched strategy to: {selected.name}{CLR_RESET}")
+            if is_systemd_service_active():
+                print(f"{CLR_YELLOW}Note: Restart systemd service to apply changes.{CLR_RESET}")
             time.sleep(1)
             return selected
     except Exception:
@@ -119,7 +125,6 @@ def menu_toggle_game_filter(cfg: dict):
 
 def menu_toggle_ipset(cfg: dict):
     cur = get_ipset_status()
-    # Cycle: loaded -> none -> any -> loaded
     order = ["loaded", "none", "any"]
     try:
         next_mode = order[(order.index(cur) + 1) % len(order)]
@@ -141,65 +146,49 @@ def menu_run_tests():
         lat_disp = f"{lat:6.1f}ms" if lat > 0 else "   -- "
         print(f"{name:<24} | {status_disp:<19} | {lat_disp:<10} | {detail}")
     print("\nPress Enter to continue...")
-    input()
+    try:
+        input()
+    except (KeyboardInterrupt, EOFError):
+        pass
 
 
 def menu_benchmark_all_strategies(cfg: dict):
     clear_screen()
     print(f"\n{CLR_BOLD}Auto-Benchmarking Strategies against YouTube & Discord...{CLR_RESET}")
-    print("Testing each strategy for ~3 seconds. Please wait...\n")
+    print("Testing each strategy. Please wait...\n")
 
-    runner = Runner(cfg)
-    strategies = list_strategies()
-    # Filter core targets to check
-    all_targets = parse_targets()
-    test_targets = {
-        k: all_targets[k]
-        for k in ["YouTubeWeb", "DiscordMain", "DiscordGateway"]
-        if k in all_targets
-    }
-
-    results_table = []
-
-    for s_name, strat in strategies.items():
-        print(f"Testing {strat.name:<24} ... ", end="", flush=True)
-        try:
-            # Stop any existing
-            runner.stop_background()
-            runner.start_background(strat)
-            time.sleep(0.8)
-
-            t_res = run_target_tests(test_targets, max_workers=3)
-            yt_ok = any(r[1] for r in t_res if "YouTube" in r[0])
-            dc_ok = any(r[1] for r in t_res if "Discord" in r[0])
-            avg_lat = sum(r[2] for r in t_res if r[1]) / (sum(1 for r in t_res if r[1]) or 1)
-
+    def on_prog(name, state, yt=False, dc=False, lat=0.0):
+        if state == "starting":
+            print(f"  Testing {name:<24} ... ", end="", flush=True)
+        elif state == "done":
             res_str = []
-            if yt_ok:
+            if yt:
                 res_str.append("YT: OK")
-            if dc_ok:
+            if dc:
                 res_str.append("DC: OK")
-
             summary = ", ".join(res_str) if res_str else "BLOCKED"
-            print(f"{summary} ({avg_lat:.0f}ms)")
-            results_table.append((strat.name, strat.filename, yt_ok, dc_ok, avg_lat))
-        except Exception as e:
-            print(f"ERR: {e}")
-        finally:
-            runner.stop_background()
+            lat_str = f"{lat:.0f}ms" if (yt or dc) else "--"
+            print(f"{summary} ({lat_str})")
+        else:
+            print(state)
+
+    results = benchmark_all_strategies(cfg, on_progress=on_prog)
 
     clear_screen()
     print(f"\n{CLR_BOLD}=== Benchmark Results ==={CLR_RESET}\n")
     print(f"{'Strategy':<25} | {'YouTube':<10} | {'Discord':<10} | {'Avg Latency'}")
     print("-" * 65)
-    for s_name, s_file, yt, dc, lat in results_table:
+    for s_name, s_file, yt, dc, lat in results:
         yt_disp = f"{CLR_GREEN}OK{CLR_RESET}" if yt else f"{CLR_RED}FAIL{CLR_RESET}"
         dc_disp = f"{CLR_GREEN}OK{CLR_RESET}" if dc else f"{CLR_RED}FAIL{CLR_RESET}"
         lat_disp = f"{lat:6.1f}ms" if (yt or dc) else "   -- "
         print(f"{s_name:<25} | {yt_disp:<19} | {dc_disp:<19} | {lat_disp}")
 
     print("\nPress Enter to return to menu...")
-    input()
+    try:
+        input()
+    except (KeyboardInterrupt, EOFError):
+        pass
 
 
 def menu_update_hosts():
@@ -212,7 +201,10 @@ def menu_update_hosts():
     except Exception as e:
         print(f"{CLR_RED}Error: {e}{CLR_RESET}")
     print("\nPress Enter to continue...")
-    input()
+    try:
+        input()
+    except (KeyboardInterrupt, EOFError):
+        pass
 
 
 def menu_diagnostics(cfg: dict):
@@ -229,7 +221,7 @@ def menu_diagnostics(cfg: dict):
     print(f"nfqws binary:          {CLR_GREEN}Found ({nfqws}){CLR_RESET}" if nfqws_ok else f"nfqws binary:          {CLR_RED}Missing{CLR_RESET}")
 
     # 3. Firewall backend
-    fw = FirewallManager()
+    fw = FirewallManager(cfg.get("firewall_backend", "auto"))
     print(f"Firewall backend:      {CLR_GREEN}{fw.backend}{CLR_RESET}")
     print(f"Firewall active table: {CLR_GREEN}YES{CLR_RESET}" if fw.is_active() else f"Firewall active table: {CLR_YELLOW}NO (idle){CLR_RESET}")
 
@@ -251,7 +243,10 @@ def menu_diagnostics(cfg: dict):
     print(f"Default route dev:     {CLR_GREEN}{iface}{CLR_RESET}")
 
     print("\nPress Enter to continue...")
-    input()
+    try:
+        input()
+    except (KeyboardInterrupt, EOFError):
+        pass
 
 
 def interactive_menu():
@@ -272,7 +267,9 @@ def interactive_menu():
 
         print("  :: CONTROLS")
         print("     1. Run in Console (Foreground test mode with live logs)")
-        if is_running:
+        if srv_status.get("active"):
+            print(f"     2. Stop Background Process {CLR_YELLOW}(systemd active - manage via 5/6){CLR_RESET}")
+        elif is_running:
             print(f"     2. {CLR_RED}Stop Background Process{CLR_RESET}")
         else:
             print(f"     2. {CLR_GREEN}Start Background Process{CLR_RESET}")
@@ -314,20 +311,29 @@ def interactive_menu():
         if choice == "0":
             break
         elif choice == "1":
+            if srv_status.get("active"):
+                print(f"\n{CLR_RED}Error: Service is active in systemd. Stop it before console test.{CLR_RESET}")
+                time.sleep(1.5)
+                continue
             clear_screen()
             runner.run_foreground(strat)
             print("\nPress Enter to return to menu...")
-            input()
+            try:
+                input()
+            except (KeyboardInterrupt, EOFError):
+                pass
         elif choice == "2":
-            if is_running:
+            if srv_status.get("active"):
+                print(f"\n{CLR_YELLOW}gnupret is managed by systemd. Use option 5 or 6 to control the service.{CLR_RESET}")
+            elif is_running:
                 runner.stop_background()
-                print(f"{CLR_GREEN}Background process stopped.{CLR_RESET}")
+                print(f"\n{CLR_GREEN}Background process stopped.{CLR_RESET}")
             else:
                 try:
                     pid = runner.start_background(strat)
-                    print(f"{CLR_GREEN}Started background process with PID {pid}.{CLR_RESET}")
+                    print(f"\n{CLR_GREEN}Started background process with PID {pid}.{CLR_RESET}")
                 except Exception as e:
-                    print(f"{CLR_RED}Failed to start: {e}{CLR_RESET}")
+                    print(f"\n{CLR_RED}Failed to start: {e}{CLR_RESET}")
             time.sleep(1)
         elif choice == "3":
             menu_select_strategy(cfg)
@@ -385,6 +391,9 @@ def interactive_menu():
             except Exception as e:
                 print(f"{CLR_RED}Sync failed: {e}{CLR_RESET}")
             print("\nPress Enter to continue...")
-            input()
+            try:
+                input()
+            except (KeyboardInterrupt, EOFError):
+                pass
         elif choice == "13":
             menu_diagnostics(cfg)

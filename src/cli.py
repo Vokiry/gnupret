@@ -1,10 +1,8 @@
 import os
 import sys
 import argparse
-from pathlib import Path
 
 from .config import (
-    BASE_DIR,
     load_config,
     save_config,
     get_ipset_status,
@@ -12,7 +10,12 @@ from .config import (
 )
 from .strategy import list_strategies, get_strategy
 from .firewall import FirewallManager
-from .runner import Runner, get_running_status, check_conflicts, get_nfqws_path
+from .runner import (
+    Runner,
+    get_running_status,
+    check_conflicts,
+    is_systemd_service_active,
+)
 from .systemd import (
     get_service_status,
     install_service,
@@ -21,10 +24,9 @@ from .systemd import (
     stop_service,
     restart_service,
     enable_service,
-    disable_service,
 )
 from .hosts import update_hosts, remove_hosts, get_hosts_status
-from .tester import run_target_tests
+from .tester import run_target_tests, benchmark_all_strategies
 from .tui import interactive_menu
 from .sync import sync_flowseal, import_bat_file
 
@@ -55,13 +57,29 @@ def cmd_select(args):
         sys.exit(1)
     cfg = load_config()
     cfg["strategy"] = strat.filename
-    save_config(cfg)
-    print(f"Selected strategy: {strat.name} ({strat.filename})")
+    try:
+        save_config(cfg)
+        print(f"Selected strategy: {strat.name} ({strat.filename})")
+    except PermissionError:
+        print("Error: Permission denied saving config.json. Try running with sudo.")
+        sys.exit(1)
 
 
 def cmd_run(args):
     check_root()
     cfg = load_config()
+
+    if is_systemd_service_active():
+        print("Error: gnupret is currently running as a systemd service.")
+        print("Stop the service first with: sudo gnupret service stop")
+        sys.exit(1)
+
+    is_running, pid, _ = get_running_status()
+    if is_running:
+        print(f"Error: gnupret background process is already running (PID: {pid}).")
+        print("Stop it first with: sudo gnupret stop")
+        sys.exit(1)
+
     strat_query = args.strategy or cfg.get("strategy", "general.conf")
     strat = get_strategy(strat_query)
     if not strat:
@@ -92,19 +110,33 @@ def cmd_stop(args):
     check_root()
     runner = Runner()
     runner.stop_background()
-    print("gnupret background process and firewall rules stopped.")
+    if is_systemd_service_active():
+        print("Notice: gnupret.service is running under systemd. Stopping it as well...")
+        stop_service()
+    print("gnupret process and firewall rules stopped.")
 
 
 def cmd_status(args):
     is_running, pid, strat_name = get_running_status()
     cfg = load_config()
-    fw = FirewallManager()
+    fw = FirewallManager(cfg.get("firewall_backend", "auto"))
     srv = get_service_status()
 
     print("\n=== gnupret Status ===")
-    print(f"  Process:        {'RUNNING (PID: ' + str(pid) + ')' if is_running else 'STOPPED'}")
+    if srv.get("active"):
+        print(f"  Process:        RUNNING (systemd, PID: {pid})")
+    elif is_running:
+        print(f"  Process:        RUNNING (daemon, PID: {pid})")
+    else:
+        print("  Process:        STOPPED")
+
     print(f"  Active Config:  {strat_name or cfg.get('strategy')}")
-    print(f"  Firewall Table: {'ACTIVE' if fw.is_active() else 'INACTIVE'}")
+
+    if os.geteuid() == 0:
+        print(f"  Firewall Table: {'ACTIVE' if fw.is_active() else 'INACTIVE'}")
+    else:
+        print("  Firewall Table: (Run with sudo to check netfilter state)")
+
     print(f"  Game Filter:    {cfg.get('game_filter_mode', 'disabled').upper()}")
     print(f"  IPSet Mode:     {get_ipset_status().upper()}")
     if srv.get("installed"):
@@ -126,6 +158,38 @@ def cmd_test(args):
     for name, ok, lat, detail in results:
         status_str = "OK" if ok else "FAIL"
         print(f"  {name:<22} : {status_str:<4} ({lat:5.1f}ms) - {detail}")
+    print()
+
+
+def cmd_test_all(args):
+    check_root()
+    print("Auto-Benchmarking all strategies against YouTube & Discord...")
+    print("Testing each strategy. Please wait...\n")
+
+    def on_prog(name, state, yt=False, dc=False, lat=0.0):
+        if state == "starting":
+            print(f"  Testing {name:<24} ... ", end="", flush=True)
+        elif state == "done":
+            res_str = []
+            if yt:
+                res_str.append("YT: OK")
+            if dc:
+                res_str.append("DC: OK")
+            summary = ", ".join(res_str) if res_str else "BLOCKED"
+            lat_str = f"{lat:.0f}ms" if (yt or dc) else "--"
+            print(f"{summary} ({lat_str})")
+        else:
+            print(state)
+
+    results = benchmark_all_strategies(on_progress=on_prog)
+    print("\n=== Benchmark Summary ===")
+    print(f"  {'Strategy':<25} | {'YouTube':<10} | {'Discord':<10} | {'Avg Latency'}")
+    print("  " + "-" * 62)
+    for s_name, s_file, yt, dc, lat in results:
+        yt_s = "OK" if yt else "FAIL"
+        dc_s = "OK" if dc else "FAIL"
+        lat_s = f"{lat:5.1f}ms" if (yt or dc) else "  -- "
+        print(f"  {s_name:<25} | {yt_s:<10} | {dc_s:<10} | {lat_s}")
     print()
 
 
@@ -160,8 +224,12 @@ def cmd_game_filter(args):
         sys.exit(1)
     cfg = load_config()
     cfg["game_filter_mode"] = mode
-    save_config(cfg)
-    print(f"Game filter set to: {mode.upper()}")
+    try:
+        save_config(cfg)
+        print(f"Game filter set to: {mode.upper()}")
+    except PermissionError:
+        print("Error: Permission denied saving config.json. Run with sudo.")
+        sys.exit(1)
 
 
 def cmd_ipset(args):
@@ -201,7 +269,8 @@ def cmd_daemon(args):
 def cmd_firewall_cleanup(args):
     """Entry point for systemd ExecStopPost or emergency cleanup."""
     check_root()
-    fw = FirewallManager()
+    cfg = load_config()
+    fw = FirewallManager(cfg.get("firewall_backend", "auto"))
     fw.teardown()
 
 
@@ -277,6 +346,10 @@ def main():
     p_test = subparsers.add_parser("test", help="Test connectivity to Discord, YouTube, Google")
     p_test.set_defaults(func=cmd_test)
 
+    # test-all
+    p_test_all = subparsers.add_parser("test-all", help="Auto-benchmark all strategies against YouTube & Discord")
+    p_test_all.set_defaults(func=cmd_test_all)
+
     # service
     p_service = subparsers.add_parser("service", help="Manage systemd service")
     p_service.add_argument("action", choices=["install", "remove", "start", "stop", "restart", "status"])
@@ -316,7 +389,6 @@ def main():
     args = parser.parse_args()
 
     if not args.command:
-        # Launch interactive TUI menu
         interactive_menu()
     else:
         args.func(args)

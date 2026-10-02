@@ -19,8 +19,8 @@ def parse_targets(file_path: Path = TARGETS_FILE) -> Dict[str, str]:
 
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
+            line = re.sub(r"#.*$", "", line).strip()
+            if not line:
                 continue
             m = re.match(r"^([A-Za-z0-9_]+)\s*=\s*[\"']?(.*?)[\"']?$", line)
             if m:
@@ -52,6 +52,7 @@ def check_target(name: str, target: str, timeout: float = 5.0) -> Tuple[str, boo
     # HTTP/HTTPS target
     url = target
     for attempt in range(2):
+        attempt_start = time.perf_counter()
         try:
             req = urllib.request.Request(
                 url,
@@ -61,21 +62,21 @@ def check_target(name: str, target: str, timeout: float = 5.0) -> Tuple[str, boo
                 }
             )
             with urllib.request.urlopen(req, timeout=timeout) as response:
-                elapsed = (time.perf_counter() - start) * 1000
+                elapsed = (time.perf_counter() - attempt_start) * 1000
                 code = response.getcode()
                 ok = (200 <= code < 400)
                 return (name, ok, elapsed, f"HTTP {code}")
         except Exception as e:
             # If response was received with error code like 403/404, TLS and connection still succeeded!
             if hasattr(e, "code"):
-                elapsed = (time.perf_counter() - start) * 1000
+                elapsed = (time.perf_counter() - attempt_start) * 1000
                 return (name, True, elapsed, f"HTTP {e.code}")
 
             if attempt == 0:
                 time.sleep(0.3)
                 continue
 
-            elapsed = (time.perf_counter() - start) * 1000
+            elapsed = (time.perf_counter() - attempt_start) * 1000
             err_msg = str(e).lower()
             if "timed out" in err_msg:
                 detail = "Timeout"
@@ -111,4 +112,68 @@ def run_target_tests(targets: Dict[str, str] = None, max_workers: int = 4) -> Li
     # Sort in original order of targets dict
     order = list(targets.keys())
     results.sort(key=lambda x: order.index(x[0]) if x[0] in order else 999)
+    return results
+
+
+def benchmark_all_strategies(cfg: dict = None, on_progress=None) -> List[Tuple[str, str, bool, bool, float]]:
+    """
+    Test YouTube and Discord connectivity against each strategy in sequence.
+    Returns: list of (strategy_name, strategy_filename, youtube_ok, discord_ok, avg_latency_ms)
+    """
+    from .config import load_config
+    from .strategy import list_strategies, get_strategy
+    from .runner import Runner, get_running_status, is_systemd_service_active
+
+    cfg = cfg or load_config()
+    was_running, prev_pid, prev_strat_name = get_running_status()
+    prev_strat = get_strategy(prev_strat_name) if prev_strat_name else None
+    had_systemd = is_systemd_service_active()
+
+    runner = Runner(cfg)
+    strategies = list_strategies()
+    all_targets = parse_targets()
+    test_targets = {
+        k: all_targets[k]
+        for k in ["YouTubeWeb", "DiscordMain", "DiscordGateway"]
+        if k in all_targets
+    }
+
+    results = []
+    try:
+        if had_systemd:
+            subprocess.run(["systemctl", "stop", "gnupret.service"], stderr=subprocess.DEVNULL)
+        elif was_running:
+            runner.stop_background()
+
+        for s_id, strat in strategies.items():
+            if on_progress:
+                on_progress(strat.name, "starting")
+            try:
+                runner.start_background(strat)
+                time.sleep(0.8)
+                t_res = run_target_tests(test_targets, max_workers=3)
+                yt_ok = any(r[1] for r in t_res if "YouTube" in r[0])
+                dc_ok = any(r[1] for r in t_res if "Discord" in r[0])
+                latencies = [r[2] for r in t_res if r[1] and r[2] > 0]
+                avg_lat = sum(latencies) / len(latencies) if latencies else 0.0
+
+                results.append((strat.name, strat.filename, yt_ok, dc_ok, avg_lat))
+                if on_progress:
+                    on_progress(strat.name, "done", yt_ok, dc_ok, avg_lat)
+            except Exception as e:
+                results.append((strat.name, strat.filename, False, False, 0.0))
+                if on_progress:
+                    on_progress(strat.name, f"error: {e}", False, False, 0.0)
+            finally:
+                runner.stop_background()
+    finally:
+        # Restore original running state
+        if had_systemd:
+            subprocess.run(["systemctl", "start", "gnupret.service"], stderr=subprocess.DEVNULL)
+        elif was_running and prev_strat:
+            try:
+                runner.start_background(prev_strat)
+            except Exception:
+                pass
+
     return results

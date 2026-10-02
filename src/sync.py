@@ -1,17 +1,28 @@
 import os
 import re
 import json
+import time
+import shutil
+import tempfile
+import subprocess
 import urllib.request
 import urllib.parse
-import subprocess
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Tuple, Optional
 
-from .config import BASE_DIR, BIN_DIR, LISTS_DIR
-from .strategy import Strategy, parse_conf_file, STRATEGIES_DIR
+from .config import BIN_DIR, LISTS_DIR, MASTER_IPSET, get_ipset_status
+from .strategy import parse_conf_file, STRATEGIES_DIR
 
 FLOWSEAL_TREE_API = "https://api.github.com/repos/Flowseal/zapret-discord-youtube/git/trees/main?recursive=1"
 FLOWSEAL_RAW_BASE = "https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main"
+
+
+def sanitize_strategy_id(raw_id: str) -> str:
+    """Sanitize strategy identifier to prevent Path Traversal and invalid filenames."""
+    cleaned = re.sub(r"[^a-zA-Z0-9_\-]", "", raw_id.strip().lower().replace(" ", "_"))
+    if not cleaned or cleaned.startswith((".", "-")):
+        cleaned = f"imported_{int(time.time())}"
+    return cleaned
 
 
 def convert_bat_to_conf(bat_content: str, filename: str) -> Tuple[str, str, str]:
@@ -66,10 +77,10 @@ def convert_bat_to_conf(bat_content: str, filename: str) -> Tuple[str, str, str]
         m = re.search(r"general\s*\((.*?)\)", clean_stem, re.IGNORECASE)
         if m:
             name = m.group(1).strip()
-            strategy_id = name.lower().replace(" ", "_")
+            strategy_id = sanitize_strategy_id(name)
         else:
             name = clean_stem
-            strategy_id = clean_stem.lower().replace(" ", "_")
+            strategy_id = sanitize_strategy_id(clean_stem)
 
     conf_content = f"""# gnupret strategy: {name}
 NAME={name}
@@ -82,31 +93,28 @@ UDP_PORTS={raw_udp}
 
 
 def verify_conf_content(strategy_id: str, conf_content: str) -> Tuple[bool, str]:
-    """Verify that converted strategy passes nfqws --dry-run."""
-    temp_conf = Path(f"/tmp/gnupret_verify_{strategy_id}.conf")
-    try:
-        temp_conf.write_text(conf_content, encoding="utf-8")
-        strat = parse_conf_file(temp_conf)
+    """Verify that converted strategy passes nfqws --dry-run safely."""
+    nfqws = BIN_DIR / "nfqws"
+    if not nfqws.exists():
+        return True, "nfqws not present to verify, skipped dry-run"
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".conf", encoding="utf-8") as temp_conf:
+        temp_conf.write(conf_content)
+        temp_conf.flush()
+        strat = parse_conf_file(Path(temp_conf.name))
         if not strat:
             return False, "Failed to parse generated .conf"
-
-        nfqws = BIN_DIR / "nfqws"
-        if not nfqws.exists():
-            return True, "nfqws not present to verify, skipped dry-run"
 
         args = [str(nfqws), "--dry-run"] + strat.build_nfqws_args(qnum=200)
         res = subprocess.run(args, capture_output=True, text=True)
         if res.returncode != 0:
             return False, res.stderr.strip() or res.stdout.strip()
         return True, "OK"
-    finally:
-        if temp_conf.exists():
-            temp_conf.unlink()
 
 
 def import_bat_file(source: str) -> Tuple[bool, str, Optional[str]]:
     """
-    Import a .bat strategy from a local path or URL.
+    Import a .bat strategy from a local path or URL securely.
     Returns: (success, message, strategy_id)
     """
     if source.startswith(("http://", "https://")):
@@ -132,11 +140,15 @@ def import_bat_file(source: str) -> Tuple[bool, str, Optional[str]]:
     except Exception as e:
         return False, f"Conversion failed: {e}", None
 
+    strat_id = sanitize_strategy_id(strat_id)
     ok, err = verify_conf_content(strat_id, conf_content)
     if not ok:
         return False, f"Validation failed with nfqws: {err}", None
 
-    dst = STRATEGIES_DIR / f"{strat_id}.conf"
+    dst = (STRATEGIES_DIR / f"{strat_id}.conf").resolve()
+    if not dst.is_relative_to(STRATEGIES_DIR.resolve()):
+        return False, "Invalid strategy path (path traversal prevented)", None
+
     dst.write_text(conf_content, encoding="utf-8")
     return True, f"Strategy '{name}' imported and verified -> strategies/{dst.name}", strat_id
 
@@ -155,12 +167,21 @@ def sync_flowseal() -> Dict[str, list]:
         "errors": []
     }
 
+    headers = {"User-Agent": "gnupret"}
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
     try:
-        req = urllib.request.Request(FLOWSEAL_TREE_API, headers={"User-Agent": "gnupret"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        req = urllib.request.Request(FLOWSEAL_TREE_API, headers=headers)
+        with urllib.request.urlopen(req, timeout=12) as resp:
             tree_data = json.load(resp)
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            raise RuntimeError("GitHub API rate limit exceeded. Please wait a short while or provide GITHUB_TOKEN.")
+        raise RuntimeError(f"GitHub API returned error {e.code}: {e.reason}")
     except Exception as e:
-        raise RuntimeError(f"Failed to fetch Flowseal tree from GitHub API: {e}")
+        raise RuntimeError(f"Failed to fetch Flowseal repository tree: {e}")
 
     items = tree_data.get("tree", [])
 
@@ -174,12 +195,15 @@ def sync_flowseal() -> Dict[str, list]:
         quoted_path = urllib.parse.quote(item["path"])
         bat_url = f"{FLOWSEAL_RAW_BASE}/{quoted_path}"
         try:
-            req = urllib.request.Request(bat_url, headers={"User-Agent": "gnupret"})
+            req = urllib.request.Request(bat_url, headers=headers)
             with urllib.request.urlopen(req, timeout=10) as resp:
                 bat_text = resp.read().decode("utf-8", errors="ignore")
 
             strat_id, name, conf_content = convert_bat_to_conf(bat_text, item["path"])
-            dest_conf = STRATEGIES_DIR / f"{strat_id}.conf"
+            strat_id = sanitize_strategy_id(strat_id)
+            dest_conf = (STRATEGIES_DIR / f"{strat_id}.conf").resolve()
+            if not dest_conf.is_relative_to(STRATEGIES_DIR.resolve()):
+                continue
 
             if dest_conf.exists():
                 existing = dest_conf.read_text(encoding="utf-8")
@@ -213,7 +237,6 @@ def sync_flowseal() -> Dict[str, list]:
         rel_filename = Path(item["path"]).name
         dst_bin = BIN_DIR / rel_filename
 
-        # Download if missing or size differs
         needs_download = False
         if not dst_bin.exists():
             needs_download = True
@@ -224,7 +247,7 @@ def sync_flowseal() -> Dict[str, list]:
             quoted_path = urllib.parse.quote(item["path"])
             bin_url = f"{FLOWSEAL_RAW_BASE}/{quoted_path}"
             try:
-                req = urllib.request.Request(bin_url, headers={"User-Agent": "gnupret"})
+                req = urllib.request.Request(bin_url, headers=headers)
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     data = resp.read()
                     dst_bin.write_bytes(data)
@@ -232,7 +255,7 @@ def sync_flowseal() -> Dict[str, list]:
             except Exception as e:
                 summary["errors"].append(f"Failed to download payload {rel_filename}: {e}")
 
-    # 3. Sync Lists (lists/*.txt)
+    # 3. Sync Lists (lists/*.txt) - Excluding dummy ipset-all.txt and user lists
     list_items = [
         item for item in items
         if item["path"].startswith("lists/") and item["path"].endswith(".txt") and "user" not in item["path"]
@@ -240,8 +263,11 @@ def sync_flowseal() -> Dict[str, list]:
 
     for item in list_items:
         rel_filename = Path(item["path"]).name
-        dst_list = LISTS_DIR / rel_filename
+        # Skip ipset-all.txt here - master is synced separately
+        if rel_filename == "ipset-all.txt":
+            continue
 
+        dst_list = LISTS_DIR / rel_filename
         needs_download = False
         if not dst_list.exists():
             needs_download = True
@@ -252,7 +278,7 @@ def sync_flowseal() -> Dict[str, list]:
             quoted_path = urllib.parse.quote(item["path"])
             list_url = f"{FLOWSEAL_RAW_BASE}/{quoted_path}"
             try:
-                req = urllib.request.Request(list_url, headers={"User-Agent": "gnupret"})
+                req = urllib.request.Request(list_url, headers=headers)
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     data = resp.read()
                     dst_list.write_bytes(data)
@@ -260,11 +286,28 @@ def sync_flowseal() -> Dict[str, list]:
             except Exception as e:
                 summary["errors"].append(f"Failed to update list {rel_filename}: {e}")
 
-    # 4. Sync hosts
+    # 4. Sync Master IPSet from .service/ipset-service.txt
+    try:
+        master_url = f"{FLOWSEAL_RAW_BASE}/.service/ipset-service.txt"
+        req = urllib.request.Request(master_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = resp.read()
+            if data and len(data) > 1000:
+                if not MASTER_IPSET.exists() or MASTER_IPSET.read_bytes() != data:
+                    MASTER_IPSET.write_bytes(data)
+                    summary["lists_updated"].append("ipset-all.txt.master (33k subnets)")
+                    # If user currently has 'loaded' mode active, refresh active file
+                    if get_ipset_status() == "loaded":
+                        active_ipset = LISTS_DIR / "ipset-all.txt"
+                        shutil.copyfile(MASTER_IPSET, active_ipset)
+    except Exception as e:
+        summary["errors"].append(f"Failed to sync master ipset: {e}")
+
+    # 5. Sync hosts
     hosts_dst = LISTS_DIR / "hosts"
     try:
         hosts_url = f"{FLOWSEAL_RAW_BASE}/.service/hosts"
-        req = urllib.request.Request(hosts_url, headers={"User-Agent": "gnupret"})
+        req = urllib.request.Request(hosts_url, headers=headers)
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = resp.read()
             if not hosts_dst.exists() or hosts_dst.read_bytes() != data:

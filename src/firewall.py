@@ -1,7 +1,32 @@
-import os
 import shutil
 import subprocess
-from typing import List, Optional
+from typing import List
+
+
+def format_and_chunk_ports(ports: List[str], max_weight: int = 15) -> List[str]:
+    """
+    Format port ranges ('-' to ':') for iptables multiport and chunk them
+    taking weight into account: single port = 1, port range = 2, max weight <= 15.
+    """
+    chunks = []
+    current_chunk = []
+    current_weight = 0
+
+    for p in ports:
+        formatted = p.replace("-", ":")
+        weight = 2 if ":" in formatted else 1
+        if current_weight + weight > max_weight:
+            if current_chunk:
+                chunks.append(",".join(current_chunk))
+            current_chunk = [formatted]
+            current_weight = weight
+        else:
+            current_chunk.append(formatted)
+            current_weight += weight
+
+    if current_chunk:
+        chunks.append(",".join(current_chunk))
+    return chunks
 
 
 class FirewallManager:
@@ -33,6 +58,17 @@ class FirewallManager:
         fwmark: str = "0x40000000",
     ) -> bool:
         """Apply firewall rules directing traffic to NFQUEUE."""
+        # Ensure nf_conntrack module is loaded
+        try:
+            subprocess.run(
+                ["modprobe", "nf_conntrack"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False
+            )
+        except Exception:
+            pass
+
         # Enable liberal conntrack for DPI RST desync handling
         try:
             subprocess.run(
@@ -44,13 +80,18 @@ class FirewallManager:
         except Exception:
             pass
 
-        # First, ensure clean slate
+        # Ensure clean slate first
         self.teardown()
 
-        if self.backend == "nftables":
-            return self._setup_nftables(tcp_ports, udp_ports, interface, qnum, fwmark)
-        else:
-            return self._setup_iptables(tcp_ports, udp_ports, interface, qnum, fwmark)
+        try:
+            if self.backend == "nftables":
+                return self._setup_nftables(tcp_ports, udp_ports, interface, qnum, fwmark)
+            else:
+                return self._setup_iptables(tcp_ports, udp_ports, interface, qnum, fwmark)
+        except Exception:
+            # Self-healing: if setup fails halfway, rollback to avoid dangling rules
+            self.teardown()
+            raise
 
     def teardown(self) -> bool:
         """Remove all gnupret firewall rules."""
@@ -147,7 +188,7 @@ class FirewallManager:
         return True
 
     def _teardown_nftables(self) -> bool:
-        proc = subprocess.run(
+        subprocess.run(
             ["nft", "delete", "table", "inet", self.TABLE_NAME],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -166,84 +207,92 @@ class FirewallManager:
         iface_out_opt = ["-o", interface] if interface and interface not in ("any", "*") else ["!", "-o", "lo"]
         iface_in_opt = ["-i", interface] if interface and interface not in ("any", "*") else ["!", "-i", "lo"]
 
-        # Create chains
-        subprocess.run(["iptables", "-t", "mangle", "-N", self.IPTABLES_CHAIN_POST], stderr=subprocess.DEVNULL)
-        subprocess.run(["iptables", "-t", "mangle", "-N", self.IPTABLES_CHAIN_PRE], stderr=subprocess.DEVNULL)
+        binaries = ["iptables"]
+        if shutil.which("ip6tables"):
+            binaries.append("ip6tables")
 
-        # Hook chains
-        subprocess.run(["iptables", "-t", "mangle", "-I", "POSTROUTING", "1", "-j", self.IPTABLES_CHAIN_POST], check=True)
-        subprocess.run(["iptables", "-t", "mangle", "-I", "PREROUTING", "1", "-j", self.IPTABLES_CHAIN_PRE], check=True)
+        tcp_chunks = format_and_chunk_ports(tcp_ports)
+        udp_chunks = format_and_chunk_ports(udp_ports)
 
-        # Add rules to POST chain
-        if tcp_ports:
-            # Multiport in iptables has a limit of 15 ports per rule; split if needed
-            for i in range(0, len(tcp_ports), 15):
-                ports_chunk = ",".join(tcp_ports[i:i + 15])
-                cmd = [
-                    "iptables", "-t", "mangle", "-A", self.IPTABLES_CHAIN_POST,
-                    "-p", "tcp", "-m", "multiport", "--dports", ports_chunk,
-                    "-m", "mark", "!", "--mark", f"{fwmark}/{fwmark}",
-                    "-m", "connbytes", "--connbytes-dir=original", "--connbytes-mode=packets", "--connbytes", "1:12",
-                    "-j", "NFQUEUE", "--queue-num", str(qnum), "--queue-bypass"
-                ] + iface_out_opt
+        for ipt in binaries:
+            # Create chains
+            subprocess.run([ipt, "-t", "mangle", "-N", self.IPTABLES_CHAIN_POST], stderr=subprocess.DEVNULL)
+            subprocess.run([ipt, "-t", "mangle", "-N", self.IPTABLES_CHAIN_PRE], stderr=subprocess.DEVNULL)
+
+            # Hook chains at head of mangle POSTROUTING and PREROUTING
+            subprocess.run([ipt, "-t", "mangle", "-I", "POSTROUTING", "1", "-j", self.IPTABLES_CHAIN_POST], check=True)
+            subprocess.run([ipt, "-t", "mangle", "-I", "PREROUTING", "1", "-j", self.IPTABLES_CHAIN_PRE], check=True)
+
+            # Add rules to POST chain (matches come before target -j NFQUEUE)
+            for chunk in tcp_chunks:
+                cmd = (
+                    [ipt, "-t", "mangle", "-A", self.IPTABLES_CHAIN_POST, "-p", "tcp"]
+                    + iface_out_opt
+                    + [
+                        "-m", "multiport", "--dports", chunk,
+                        "-m", "mark", "!", "--mark", f"{fwmark}/{fwmark}",
+                        "-m", "connbytes", "--connbytes-dir", "original", "--connbytes-mode", "packets", "--connbytes", "1:12",
+                        "-j", "NFQUEUE", "--queue-num", str(qnum), "--queue-bypass"
+                    ]
+                )
                 subprocess.run(cmd, check=True)
 
-        if udp_ports:
-            for i in range(0, len(udp_ports), 15):
-                ports_chunk = ",".join(udp_ports[i:i + 15])
-                cmd = [
-                    "iptables", "-t", "mangle", "-A", self.IPTABLES_CHAIN_POST,
-                    "-p", "udp", "-m", "multiport", "--dports", ports_chunk,
-                    "-m", "mark", "!", "--mark", f"{fwmark}/{fwmark}",
-                    "-j", "NFQUEUE", "--queue-num", str(qnum), "--queue-bypass"
-                ] + iface_out_opt
+            for chunk in udp_chunks:
+                cmd = (
+                    [ipt, "-t", "mangle", "-A", self.IPTABLES_CHAIN_POST, "-p", "udp"]
+                    + iface_out_opt
+                    + [
+                        "-m", "multiport", "--dports", chunk,
+                        "-m", "mark", "!", "--mark", f"{fwmark}/{fwmark}",
+                        "-j", "NFQUEUE", "--queue-num", str(qnum), "--queue-bypass"
+                    ]
+                )
                 subprocess.run(cmd, check=True)
 
-        # Add rules to PRE chain
-        if tcp_ports:
-            for i in range(0, len(tcp_ports), 15):
-                ports_chunk = ",".join(tcp_ports[i:i + 15])
-                cmd = [
-                    "iptables", "-t", "mangle", "-A", self.IPTABLES_CHAIN_PRE,
-                    "-p", "tcp", "-m", "multiport", "--sports", ports_chunk,
-                    "-m", "connbytes", "--connbytes-dir=reply", "--connbytes-mode=packets", "--connbytes", "1:3",
-                    "-j", "NFQUEUE", "--queue-num", str(qnum), "--queue-bypass"
-                ] + iface_in_opt
+            # Add rules to PRE chain
+            for chunk in tcp_chunks:
+                cmd = (
+                    [ipt, "-t", "mangle", "-A", self.IPTABLES_CHAIN_PRE, "-p", "tcp"]
+                    + iface_in_opt
+                    + [
+                        "-m", "multiport", "--sports", chunk,
+                        "-m", "connbytes", "--connbytes-dir", "reply", "--connbytes-mode", "packets", "--connbytes", "1:3",
+                        "-j", "NFQUEUE", "--queue-num", str(qnum), "--queue-bypass"
+                    ]
+                )
                 subprocess.run(cmd, check=True)
 
         return True
 
     def _teardown_iptables(self) -> bool:
-        # Remove jump rules
-        subprocess.run(
-            ["iptables", "-t", "mangle", "-D", "POSTROUTING", "-j", self.IPTABLES_CHAIN_POST],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        subprocess.run(
-            ["iptables", "-t", "mangle", "-D", "PREROUTING", "-j", self.IPTABLES_CHAIN_PRE],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        # Flush and delete chains
-        subprocess.run(
-            ["iptables", "-t", "mangle", "-F", self.IPTABLES_CHAIN_POST],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        subprocess.run(
-            ["iptables", "-t", "mangle", "-X", self.IPTABLES_CHAIN_POST],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        subprocess.run(
-            ["iptables", "-t", "mangle", "-F", self.IPTABLES_CHAIN_PRE],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        subprocess.run(
-            ["iptables", "-t", "mangle", "-X", self.IPTABLES_CHAIN_PRE],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
+        binaries = ["iptables"]
+        if shutil.which("ip6tables"):
+            binaries.append("ip6tables")
+
+        for ipt in binaries:
+            # Repeatedly remove jump rules until none remain (handles duplicate hooks)
+            while True:
+                res = subprocess.run(
+                    [ipt, "-t", "mangle", "-D", "POSTROUTING", "-j", self.IPTABLES_CHAIN_POST],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                if res.returncode != 0:
+                    break
+
+            while True:
+                res = subprocess.run(
+                    [ipt, "-t", "mangle", "-D", "PREROUTING", "-j", self.IPTABLES_CHAIN_PRE],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                if res.returncode != 0:
+                    break
+
+            # Flush and delete chains
+            subprocess.run([ipt, "-t", "mangle", "-F", self.IPTABLES_CHAIN_POST], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run([ipt, "-t", "mangle", "-X", self.IPTABLES_CHAIN_POST], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run([ipt, "-t", "mangle", "-F", self.IPTABLES_CHAIN_PRE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run([ipt, "-t", "mangle", "-X", self.IPTABLES_CHAIN_PRE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
         return True

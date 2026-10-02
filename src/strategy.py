@@ -73,7 +73,11 @@ class Strategy:
         # Fix batch escaped exclamation marks for nfqws
         content = content.replace("^!", "!")
 
-        args = shlex.split(content)
+        try:
+            args = shlex.split(content)
+        except ValueError as e:
+            raise ValueError(f"Malformed arguments in strategy '{self.name}': {e}")
+
         cmd = ["--qnum", str(qnum)]
         if custom_fwmark:
             cmd.extend(["--dpi-desync-fwmark", str(custom_fwmark)])
@@ -157,19 +161,36 @@ def get_strategy(strategy_query: str, base_dir: Path = BASE_DIR) -> Optional[Str
     if query_lower in strats:
         return strats[query_lower]
 
+    # Common aliases: alt1 -> alt
+    if query_lower in ("alt1", "alt-1", "alt_1") and "alt" in strats:
+        return strats["alt"]
+
     # Without extension match
     stem = Path(query_lower).stem
     if stem in strats:
         return strats[stem]
+    if stem in ("alt1", "alt-1", "alt_1") and "alt" in strats:
+        return strats["alt"]
 
     # Filename match
     for s in strats.values():
         if s.filename.lower() == query_lower:
             return s
 
-    # Name match
+    # Exact Name match (case-insensitive)
     for s in strats.values():
-        if s.name.lower() == query_lower or query_lower in s.name.lower():
+        if s.name.lower() == query_lower:
+            return s
+
+    # Word boundary match (e.g. "ALT" won't match "ALT10")
+    for s in strats.values():
+        pattern = rf"\b{re.escape(query_lower)}\b"
+        if re.search(pattern, s.name, re.IGNORECASE):
+            return s
+
+    # Fallback substring match
+    for s in strats.values():
+        if query_lower in s.name.lower():
             return s
 
     return None
